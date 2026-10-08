@@ -1,101 +1,205 @@
-"""OCR extraction from PDF pages using PyMuPDF and Tesseract."""
+"""Selective, memory-bounded OCR using the local Tesseract engine."""
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from pathlib import Path
+from time import perf_counter
 
-import fitz
+from PIL import Image
+import pytesseract
+from pytesseract import TesseractNotFoundError
 
-from utils.text_utils import clean_extracted_text
+try:
+    import pymupdf
+except ImportError:
+    import fitz as pymupdf
 
-
-class OCRExtractionError(RuntimeError):
-    """Raised when OCR cannot process a PDF page."""
-
-
-@dataclass(frozen=True)
-class OCRResult:
-    """Text and metadata returned by a page-level OCR operation."""
-
-    text: str
-    language: str
-    dpi: int
-    full_page: bool
+from extraction.inspection_models import OCRDocumentResult, OCRPageResult
 
 
-def configure_tessdata(tessdata_path: str | None = None) -> str | None:
-    """
-    Configure the Tesseract language-data directory.
+def configure_tesseract(
+    *,
+    tesseract_command: str | None = None,
+    tessdata_path: str | None = None,
+) -> str:
+    """Configure and verify the local Tesseract executable."""
 
-    The supplied directory should contain files such as eng.traineddata.
-    """
-
-    if not tessdata_path:
-        return os.environ.get("TESSDATA_PREFIX")
-
-    normalized_path = os.path.abspath(
-        os.path.expanduser(tessdata_path)
+    configured_command = (
+        tesseract_command
+        or os.environ.get("TESSERACT_CMD")
+        or r"C:\Program Files\Tesseract-OCR\tesseract.exe"
     )
 
-    if not os.path.isdir(normalized_path):
-        raise FileNotFoundError(
-            f"Tesseract data directory was not found: {normalized_path}"
+    command_path = Path(configured_command)
+    if not command_path.is_file():
+        raise TesseractNotFoundError(
+            "Tesseract executable was not found. Set TESSERACT_CMD in .env "
+            "to the full path of tesseract.exe. Current value: "
+            f"{configured_command}"
         )
 
-    os.environ["TESSDATA_PREFIX"] = normalized_path
+    pytesseract.pytesseract.tesseract_cmd = str(command_path)
 
-    return normalized_path
-
-
-def extract_text_with_ocr(
-    page: fitz.Page,
-    *,
-    language: str = "eng",
-    dpi: int = 300,
-    full_page: bool = True,
-    tessdata_path: str | None = None,
-) -> OCRResult:
-    """
-    Run Tesseract OCR on one PDF page through PyMuPDF.
-
-    The returned text is cleaned but page coordinates are not currently
-    included in the application result.
-    """
-
-    if page is None:
-        raise ValueError("A valid PyMuPDF page is required.")
-
-    if dpi < 72:
-        raise ValueError("OCR DPI must be at least 72.")
-
-    configure_tessdata(tessdata_path)
+    configured_tessdata = (
+        tessdata_path
+        or os.environ.get("TESSDATA_PREFIX")
+        or str(command_path.parent / "tessdata")
+    )
+    tessdata_directory = Path(configured_tessdata)
+    if tessdata_directory.is_dir():
+        os.environ["TESSDATA_PREFIX"] = str(tessdata_directory)
 
     try:
-        text_page = page.get_textpage_ocr(
-            language=language,
-            dpi=dpi,
-            full=full_page,
-        )
-
-        extracted_text = page.get_text(
-            "text",
-            textpage=text_page,
-            sort=True,
-        )
-
+        version = pytesseract.get_tesseract_version()
     except Exception as exc:
-        message = str(exc).strip() or exc.__class__.__name__
-
-        raise OCRExtractionError(
-            "OCR failed. Confirm that Tesseract OCR is installed and "
-            "that TESSDATA_PREFIX points to the folder containing "
-            f"the requested language data. Original error: {message}"
+        raise RuntimeError(
+            "Tesseract was found but could not be started: "
+            f"{exc}"
         ) from exc
 
-    return OCRResult(
-        text=clean_extracted_text(extracted_text),
-        language=language,
-        dpi=dpi,
-        full_page=full_page,
+    return str(version)
+
+
+def _quality(text: str) -> float:
+    if not text:
+        return 0.0
+    printable = sum(character.isprintable() for character in text) / len(text)
+    useful = sum(character.isalnum() for character in text) / len(text)
+    return round(min(1.0, (printable * 0.55) + (useful * 0.45)), 3)
+
+
+def ocr_selected_pages(
+    source_path: str | Path,
+    page_numbers: list[int],
+    *,
+    filename: str | None = None,
+    language: str = "eng",
+    dpi: int = 250,
+    tessdata_path: str | None = None,
+    tesseract_command: str | None = None,
+    minimum_ocr_characters: int = 20,
+    page_timeout_seconds: int = 120,
+) -> OCRDocumentResult:
+    """OCR only requested pages, releasing each rendered image immediately."""
+
+    started = perf_counter()
+    path = Path(source_path)
+    requested_pages = sorted(set(page_numbers))
+    page_results: list[OCRPageResult] = []
+
+    try:
+        tesseract_version = configure_tesseract(
+            tesseract_command=tesseract_command,
+            tessdata_path=tessdata_path,
+        )
+    except Exception as exc:
+        error_message = f"OCR engine configuration failed: {exc}"
+        return OCRDocumentResult(
+            filename=filename or path.name,
+            source_path=str(path.resolve()),
+            requested_page_numbers=requested_pages,
+            pages=[
+                OCRPageResult(
+                    page_number=page_number,
+                    successful=False,
+                    needs_review=True,
+                    review_reasons=[error_message],
+                    error=error_message,
+                )
+                for page_number in requested_pages
+            ],
+            processing_seconds=round(perf_counter() - started, 3),
+        )
+
+    with pymupdf.open(str(path)) as document:
+        for page_number in requested_pages:
+            pixmap = None
+            image = None
+            try:
+                if page_number < 1 or page_number > document.page_count:
+                    raise ValueError(
+                        f"Page {page_number} is outside the PDF page range."
+                    )
+
+                page = document.load_page(page_number - 1)
+                scale = dpi / 72.0
+                pixmap = page.get_pixmap(
+                    matrix=pymupdf.Matrix(scale, scale),
+                    alpha=False,
+                    colorspace=pymupdf.csRGB,
+                )
+                image = Image.frombytes(
+                    "RGB",
+                    (pixmap.width, pixmap.height),
+                    pixmap.samples,
+                )
+
+                text = pytesseract.image_to_string(
+                    image,
+                    lang=language,
+                    config="--oem 3 --psm 6",
+                    timeout=page_timeout_seconds,
+                ).strip()
+
+                character_count = len(text)
+                successful = character_count >= minimum_ocr_characters
+                review_reasons = []
+                if not successful:
+                    review_reasons.append(
+                        "Tesseract ran successfully but produced only "
+                        f"{character_count} characters."
+                    )
+
+                page_results.append(
+                    OCRPageResult(
+                        page_number=page_number,
+                        text=text,
+                        character_count=character_count,
+                        word_count=len(text.split()),
+                        quality_score=_quality(text),
+                        successful=successful,
+                        needs_review=not successful,
+                        review_reasons=review_reasons,
+                        error=None,
+                    )
+                )
+
+            except RuntimeError as exc:
+                message = (
+                    f"OCR timed out or Tesseract failed on page {page_number}: "
+                    f"{exc}"
+                )
+                page_results.append(
+                    OCRPageResult(
+                        page_number=page_number,
+                        successful=False,
+                        needs_review=True,
+                        review_reasons=[message],
+                        error=message,
+                    )
+                )
+            except Exception as exc:
+                message = f"OCR failed on page {page_number}: {exc}"
+                page_results.append(
+                    OCRPageResult(
+                        page_number=page_number,
+                        successful=False,
+                        needs_review=True,
+                        review_reasons=[message],
+                        error=message,
+                    )
+                )
+            finally:
+                if image is not None:
+                    image.close()
+                del image
+                del pixmap
+
+    return OCRDocumentResult(
+        filename=filename or path.name,
+        source_path=str(path.resolve()),
+        requested_page_numbers=requested_pages,
+        pages=page_results,
+        processing_seconds=round(perf_counter() - started, 3),
     )
