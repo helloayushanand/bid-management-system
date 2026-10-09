@@ -225,6 +225,9 @@ class GroqAdapter(BaseLLMAdapter):
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": self.settings.temperature,
+            "max_completion_tokens": (
+                self.settings.max_completion_tokens
+            ),
             "response_format": response_format,
             "stream": False,
         }
@@ -282,6 +285,20 @@ class GroqAdapter(BaseLLMAdapter):
                 )
 
             except RateLimitError as exc:
+                error_text = str(exc).lower()
+                if (
+                    "request too large" in error_text
+                    or "expected output tokens exceed" in error_text
+                ):
+                    raise LLMProviderError(
+                        "Groq rejected the request because the configured "
+                        "maximum completion tokens exceed the account OTPM "
+                        "limit. Reduce GROQ_MAX_COMPLETION_TOKENS. "
+                        f"Current value: "
+                        f"{self.settings.max_completion_tokens}. "
+                        f"Provider error: {exc}"
+                    ) from exc
+
                 rate_failures += 1
                 if rate_failures > self.settings.rate_limit_max_retries:
                     raise LLMProviderError(

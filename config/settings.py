@@ -80,6 +80,7 @@ class GroqSettings:
     model: str
     response_mode: str = "json_object"
     temperature: float = 0.0
+    max_completion_tokens: int = 900
     max_retries: int = 3
     rate_limit_max_retries: int = 5
     request_timeout_seconds: float = 120.0
@@ -105,6 +106,11 @@ class GroqSettings:
             response_mode=response_mode,
             temperature=get_float_environment_variable(
                 "GROQ_TEMPERATURE", 0.0, minimum=0.0, maximum=2.0
+            ),
+            max_completion_tokens=get_integer_environment_variable(
+                "GROQ_MAX_COMPLETION_TOKENS",
+                900,
+                minimum=100,
             ),
             max_retries=get_integer_environment_variable(
                 "GROQ_MAX_RETRIES", 3, minimum=0
